@@ -2,19 +2,17 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build go1.5
-
-// This file is a copy of $GOROOT/src/go/internal/gcimporter/gcimporter.go, tagged for go1.5,
-// and minimally adjusted to make it build.
+// This file is a copy of $GOROOT/src/go/internal/gcimporter/gcimporter.go,
+// but it also contains the original source-based importer code for Go1.6.
+// Once we stop supporting 1.6, we can remove that code.
 
 // Package gcimporter15 provides various functions for reading
 // gc-generated object files that can be used to implement the
 // Importer interface defined by the Go 1.5 standard library package.
 //
-// This package serves as a stop-gap for missing features in the
-// standard library's go/importer package, specifically customizable
-// package data lookup. This package should be deleted once that
-// functionality becomes available in the standard library.
+// Deprecated: this package will be deleted in October 2017.
+// New code should use golang.org/x/tools/go/gcexportdata.
+//
 package gcimporter // import "golang.org/x/tools/go/gcimporter15"
 
 import (
@@ -42,7 +40,8 @@ var pkgExts = [...]string{".a", ".o"}
 
 // FindPkg returns the filename and unique package id for an import
 // path based on package information provided by build.Import (using
-// the build.Default build.Context).
+// the build.Default build.Context). A relative srcDir is interpreted
+// relative to the current working directory.
 // If no file was found, an empty filename is returned.
 //
 func FindPkg(path, srcDir string) (filename, id string) {
@@ -55,6 +54,9 @@ func FindPkg(path, srcDir string) (filename, id string) {
 	default:
 		// "x" -> "$GOPATH/pkg/$GOOS_$GOARCH/x.ext", "x"
 		// Don't require the source files to be present.
+		if abs, err := filepath.Abs(srcDir); err == nil { // see issue 14282
+			srcDir = abs
+		}
 		bp, _ := build.Import(path, srcDir, build.FindOnly|build.AllowBinary)
 		if bp.PkgObj == "" {
 			return
@@ -170,7 +172,8 @@ func Import(packages map[string]*types.Package, path, srcDir string) (pkg *types
 		var data []byte
 		data, err = ioutil.ReadAll(buf)
 		if err == nil {
-			_, pkg, err = BImportData(packages, data, path)
+			fset := token.NewFileSet()
+			_, pkg, err = BImportData(fset, packages, data, id)
 			return
 		}
 	default:
@@ -390,9 +393,9 @@ func (p *parser) getPkg(id, name string) *types.Package {
 		// package exists already and we have an expected package name;
 		// make sure names match or set package name if necessary
 		if pname := pkg.Name(); pname == "" {
-			setName(pkg, name)
+			pkg.SetName(name)
 		} else if pname != name {
-			p.errorf("%s package name mismatch: %s (given) vs %s (expected)", pname, name)
+			p.errorf("%s package name mismatch: %s (given) vs %s (expected)", id, pname, name)
 		}
 	}
 	return pkg
@@ -458,7 +461,7 @@ func (p *parser) parseMapType(parent *types.Package) types.Type {
 // For qualified names, the returned package is nil (and not created if
 // it doesn't exist yet) unless materializePkg is set (which creates an
 // unnamed package with valid package path). In the latter case, a
-// subequent import clause is expected to provide a name for the package.
+// subsequent import clause is expected to provide a name for the package.
 //
 func (p *parser) parseName(parent *types.Package, materializePkg bool) (pkg *types.Package, name string) {
 	pkg = parent
@@ -497,6 +500,19 @@ func deref(typ types.Type) types.Type {
 //
 func (p *parser) parseField(parent *types.Package) (*types.Var, string) {
 	pkg, name := p.parseName(parent, true)
+
+	if name == "_" {
+		// Blank fields should be package-qualified because they
+		// are unexported identifiers, but gc does not qualify them.
+		// Assuming that the ident belongs to the current package
+		// causes types to change during re-exporting, leading
+		// to spurious "can't assign A to B" errors from go/types.
+		// As a workaround, pretend all blank fields belong
+		// to the same unique dummy package.
+		const blankpkg = "<_>"
+		pkg = p.getPkg(blankpkg, blankpkg)
+	}
+
 	typ := p.parseType(parent)
 	anonymous := false
 	if name == "" {

@@ -2,19 +2,16 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build go1.5
-
 package main
 
 import (
 	"bytes"
 	"fmt"
+	exact "go/constant"
 	"go/token"
+	"go/types"
 	"io"
 	"math/big"
-
-	"golang.org/x/tools/go/exact"
-	"golang.org/x/tools/go/types"
 )
 
 // TODO(gri) use tabwriter for alignment?
@@ -144,7 +141,13 @@ func (p *printer) printPackage(pkg *types.Package, filter func(types.Object) boo
 	p.printDecl("type", len(typez), func() {
 		for _, obj := range typez {
 			p.printf("%s ", obj.Name())
-			p.writeType(p.pkg, obj.Type().Underlying())
+			typ := obj.Type()
+			if isAlias(obj) {
+				p.print("= ")
+				p.writeType(p.pkg, typ)
+			} else {
+				p.writeType(p.pkg, typ.Underlying())
+			}
 			p.print("\n")
 		}
 	})

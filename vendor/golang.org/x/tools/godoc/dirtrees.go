@@ -7,7 +7,6 @@
 package godoc
 
 import (
-	"bytes"
 	"go/doc"
 	"go/parser"
 	"go/token"
@@ -54,6 +53,10 @@ type treeBuilder struct {
 	maxDepth int
 }
 
+// ioGate is a semaphore controlling VFS activity (ReadDir, parseFile, etc).
+// Send before an operation and receive after.
+var ioGate = make(chan bool, 20)
+
 func (b *treeBuilder) newDirTree(fset *token.FileSet, path, name string, depth int) *Directory {
 	if name == testdataDirName {
 		return nil
@@ -85,46 +88,63 @@ func (b *treeBuilder) newDirTree(fset *token.FileSet, path, name string, depth i
 		}
 	}
 
-	list, _ := b.c.fs.ReadDir(path)
+	ioGate <- true
+	list, err := b.c.fs.ReadDir(path)
+	<-ioGate
+	if err != nil {
+		// TODO: propagate more. See golang.org/issue/14252.
+		// For now:
+		if b.c.Verbose {
+			log.Printf("newDirTree reading %s: %v", path, err)
+		}
+	}
 
 	// determine number of subdirectories and if there are package files
 	var dirchs []chan *Directory
 
 	for _, d := range list {
+		filename := pathpkg.Join(path, d.Name())
 		switch {
 		case isPkgDir(d):
 			ch := make(chan *Directory, 1)
 			dirchs = append(dirchs, ch)
-			go func(d os.FileInfo) {
-				name := d.Name()
-				ch <- b.newDirTree(fset, pathpkg.Join(path, name), name, depth+1)
-			}(d)
+			name := d.Name()
+			go func() {
+				ch <- b.newDirTree(fset, filename, name, depth+1)
+			}()
 		case !haveSummary && isPkgFile(d):
 			// looks like a package file, but may just be a file ending in ".go";
 			// don't just count it yet (otherwise we may end up with hasPkgFiles even
 			// though the directory doesn't contain any real package files - was bug)
 			// no "optimal" package synopsis yet; continue to collect synopses
-			file, err := b.c.parseFile(fset, pathpkg.Join(path, d.Name()),
-				parser.ParseComments|parser.PackageClauseOnly)
-			if err == nil {
-				hasPkgFiles = true
-				if file.Doc != nil {
-					// prioritize documentation
-					i := -1
-					switch file.Name.Name {
-					case name:
-						i = 0 // normal case: directory name matches package name
-					case "main":
-						i = 1 // directory contains a main package
-					default:
-						i = 2 // none of the above
-					}
-					if 0 <= i && i < len(synopses) && synopses[i] == "" {
-						synopses[i] = doc.Synopsis(file.Doc.Text())
-					}
+			ioGate <- true
+			const flags = parser.ParseComments | parser.PackageClauseOnly
+			file, err := b.c.parseFile(fset, filename, flags)
+			<-ioGate
+			if err != nil {
+				if b.c.Verbose {
+					log.Printf("Error parsing %v: %v", filename, err)
 				}
-				haveSummary = synopses[0] != ""
+				break
 			}
+
+			hasPkgFiles = true
+			if file.Doc != nil {
+				// prioritize documentation
+				i := -1
+				switch file.Name.Name {
+				case name:
+					i = 0 // normal case: directory name matches package name
+				case "main":
+					i = 1 // directory contains a main package
+				default:
+					i = 2 // none of the above
+				}
+				if 0 <= i && i < len(synopses) && synopses[i] == "" {
+					synopses[i] = doc.Synopsis(file.Doc.Text())
+				}
+			}
+			haveSummary = synopses[0] != ""
 		}
 	}
 
@@ -193,20 +213,6 @@ func (c *Corpus) newDirectory(root string, maxDepth int) *Directory {
 	// the file set provided is only for local parsing, no position
 	// information escapes and thus we don't need to save the set
 	return b.newDirTree(token.NewFileSet(), root, d.Name(), 0)
-}
-
-func (dir *Directory) writeLeafs(buf *bytes.Buffer) {
-	if dir != nil {
-		if len(dir.Dirs) == 0 {
-			buf.WriteString(dir.Path)
-			buf.WriteByte('\n')
-			return
-		}
-
-		for _, d := range dir.Dirs {
-			d.writeLeafs(buf)
-		}
-	}
 }
 
 func (dir *Directory) walk(c chan<- *Directory, skipRoot bool) {

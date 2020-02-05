@@ -1,12 +1,23 @@
 // The package doc comment
 package initial
 
-import "fmt"
+import (
+	"fmt"
 
-type t int
+	"domain.name/importdecl"
+)
 
-const c = 1
+type t int // type1
+
+// const1
+const c = 1 // const2
 
 func foo() {
-	fmt.Println()
+	fmt.Println(importdecl.F())
 }
+
+// zinit
+const (
+	z1 = iota // z1
+	z2        // z2
+) // zend

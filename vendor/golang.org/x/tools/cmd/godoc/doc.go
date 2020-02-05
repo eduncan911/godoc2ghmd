@@ -35,9 +35,11 @@ web page.
 	godoc -http=:6060
 
 Usage:
+
 	godoc [flag] package [name ...]
 
 The flags are:
+
 	-v
 		verbose mode
 	-q
@@ -82,9 +84,9 @@ The flags are:
 		webserver address for command line searches
 	-analysis=type,pointer
 		comma-separated list of analyses to perform
-    		"type": display identifier resolution, type info, method sets,
+		"type": display identifier resolution, type info, method sets,
 			'implements', and static callees
-		"pointer" display channel peers, callers and dynamic callees
+		"pointer": display channel peers, callers and dynamic callees
 			(significantly slower)
 		See http://golang.org/lib/godoc/analysis/help.html for details.
 	-templates=""
@@ -109,6 +111,11 @@ via regular expressions). The maximum number of full text search results shown
 can be set with the -maxresults flag; if set to 0, no full text results are
 shown, and only an identifier index but no full text search index is created.
 
+By default, godoc uses the system's GOOS/GOARCH; in command-line mode you can
+set the GOOS/GOARCH environment variables to get output for the system specified.
+If -http was specified you can provide the URL parameters "GOOS" and "GOARCH"
+to set the output on the web page.
+
 The presentation mode of web pages served by godoc can be controlled with the
 "m" URL parameter; it accepts a comma-separated list of flag names as value:
 
@@ -129,7 +136,7 @@ slash ('/') as path separator; and they must be unrooted. $GOROOT (or -goroot)
 must be set to the .zip file directory path containing the Go root directory.
 For instance, for a .zip file created by the command:
 
-	zip go.zip $HOME/go
+	zip -r go.zip $HOME/go
 
 one may run godoc as follows:
 

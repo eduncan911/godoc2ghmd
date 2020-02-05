@@ -29,6 +29,18 @@ pre .selection-comment {
 }
 pre .ln {
 	color: #999;
+	background: #efefef;
+}
+.ln {
+	-webkit-user-select: none;
+	-moz-user-select: none;
+	-ms-user-select: none;
+	user-select: none;
+}
+.ln::before {
+	/* Inserting the line numbers as a ::before pseudo-element avoids making
+	 * them selectable; it's the trick Github uses as well. */
+	content: attr(data-content);
 }
 body {
 	color: #222;
@@ -42,6 +54,20 @@ a:hover,
 .exampleHeading .text:hover {
 	text-decoration: underline;
 }
+.article a {
+	text-decoration: underline;
+}
+.article .title a {
+	text-decoration: none;
+}
+
+.permalink {
+	display: none;
+}
+:hover > .permalink {
+	display: inline;
+}
+
 p, li {
 	max-width: 800px;
 	word-wrap: break-word;
@@ -74,6 +100,9 @@ h4,
 h1 {
 	font-size: 28px;
 	line-height: 1;
+}
+h1 .text-muted {
+	color:#777;
 }
 h2 {
 	font-size: 20px;
@@ -437,10 +466,10 @@ div#blog .read {
 }
 
 .toggleButton { cursor: pointer; }
-.toggle .collapsed { display: block; }
-.toggle .expanded { display: none; }
-.toggleVisible .collapsed { display: none; }
-.toggleVisible .expanded { display: block; }
+.toggle > .collapsed { display: block; }
+.toggle > .expanded { display: none; }
+.toggleVisible > .collapsed { display: none; }
+.toggleVisible > .expanded { display: block; }
 
 table.codetable { margin-left: auto; margin-right: auto; border-style: none; }
 table.codetable td { padding-right: 10px; }

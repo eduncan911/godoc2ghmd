@@ -54,18 +54,21 @@ func (s *handlerServer) registerWithMux(mux *http.ServeMux) {
 // directories, PageInfo.Dirs is nil. If an error occurred, PageInfo.Err is
 // set to the respective error but the error is not logged.
 //
-func (h *handlerServer) GetPageInfo(abspath, relpath string, mode PageInfoMode) *PageInfo {
-	info := &PageInfo{Dirname: abspath}
+func (h *handlerServer) GetPageInfo(abspath, relpath string, mode PageInfoMode, goos, goarch string) *PageInfo {
+	info := &PageInfo{Dirname: abspath, Mode: mode}
 
 	// Restrict to the package files that would be used when building
 	// the package on this system.  This makes sure that if there are
 	// separate implementations for, say, Windows vs Unix, we don't
 	// jumble them all together.
-	// Note: Uses current binary's GOOS/GOARCH.
-	// To use different pair, such as if we allowed the user to choose,
-	// set ctxt.GOOS and ctxt.GOARCH before calling ctxt.ImportDir.
+	// Note: If goos/goarch aren't set, the current binary's GOOS/GOARCH
+	// are used.
 	ctxt := build.Default
 	ctxt.IsAbsPath = pathpkg.IsAbs
+	ctxt.IsDir = func(path string) bool {
+		fi, err := h.c.fs.Stat(filepath.ToSlash(path))
+		return err == nil && fi.IsDir()
+	}
 	ctxt.ReadDir = func(dir string) ([]os.FileInfo, error) {
 		f, err := h.c.fs.ReadDir(filepath.ToSlash(dir))
 		filtered := make([]os.FileInfo, 0, len(f))
@@ -82,6 +85,13 @@ func (h *handlerServer) GetPageInfo(abspath, relpath string, mode PageInfoMode) 
 			return nil, err
 		}
 		return ioutil.NopCloser(bytes.NewReader(data)), nil
+	}
+
+	if goos != "" {
+		ctxt.GOOS = goos
+	}
+	if goarch != "" {
+		ctxt.GOARCH = goarch
 	}
 
 	pkginfo, err := ctxt.ImportDir(abspath, 0)
@@ -197,6 +207,7 @@ func (h *handlerServer) GetPageInfo(abspath, relpath string, mode PageInfoMode) 
 		timestamp = time.Now()
 	}
 	info.Dirs = dir.listing(true, func(path string) bool { return h.includePath(path, mode) })
+
 	info.DirTime = timestamp
 	info.DirFlat = mode&FlatDir != 0
 
@@ -242,7 +253,7 @@ func (h *handlerServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if relpath == builtinPkgPath {
 		mode = NoFiltering | NoTypeAssoc
 	}
-	info := h.GetPageInfo(abspath, relpath, mode)
+	info := h.GetPageInfo(abspath, relpath, mode, r.FormValue("GOOS"), r.FormValue("GOARCH"))
 	if info.Err != nil {
 		log.Print(info.Err)
 		h.p.ServeError(w, r, relpath, info.Err)
@@ -301,19 +312,21 @@ func (h *handlerServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		info.TypeInfoIndex[ti.Name] = i
 	}
 
-	info.Share = allowShare(r)
+	info.GoogleCN = googleCN(r)
 	h.p.ServePage(w, Page{
 		Title:    title,
 		Tabtitle: tabtitle,
 		Subtitle: subtitle,
 		Body:     applyTemplate(h.p.PackageHTML, "packageHTML", info),
-		Share:    info.Share,
+		GoogleCN: info.GoogleCN,
 	})
 }
 
 type PageInfoMode uint
 
 const (
+	PageInfoModeQueryString = "m" // query string where PageInfoMode is stored
+
 	NoFiltering PageInfoMode = 1 << iota // do not filter exports
 	AllMethods                           // show all embedded methods
 	ShowSource                           // show source code, do not extract documentation
@@ -331,12 +344,32 @@ var modeNames = map[string]PageInfoMode{
 	"flat":    FlatDir,
 }
 
+// generate a query string for persisting PageInfoMode between pages.
+func modeQueryString(mode PageInfoMode) string {
+	if modeNames := mode.names(); len(modeNames) > 0 {
+		return "?m=" + strings.Join(modeNames, ",")
+	}
+	return ""
+}
+
+// alphabetically sorted names of active flags for a PageInfoMode.
+func (m PageInfoMode) names() []string {
+	var names []string
+	for name, mode := range modeNames {
+		if m&mode != 0 {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
 // GetPageInfoMode computes the PageInfoMode flags by analyzing the request
 // URL form value "m". It is value is a comma-separated list of mode names
 // as defined by modeNames (e.g.: m=src,text).
 func (p *Presentation) GetPageInfoMode(r *http.Request) PageInfoMode {
 	var mode PageInfoMode
-	for _, k := range strings.Split(r.FormValue("m"), ",") {
+	for _, k := range strings.Split(r.FormValue(PageInfoModeQueryString), ",") {
 		if m, found := modeNames[strings.TrimSpace(k)]; found {
 			mode |= m
 		}
@@ -513,7 +546,7 @@ func (p *Presentation) serveTextFile(w http.ResponseWriter, r *http.Request, abs
 		return
 	}
 
-	if r.FormValue("m") == "text" {
+	if r.FormValue(PageInfoModeQueryString) == "text" {
 		p.ServeText(w, src)
 		return
 	}
@@ -546,10 +579,11 @@ func (p *Presentation) serveTextFile(w http.ResponseWriter, r *http.Request, abs
 	fmt.Fprintf(&buf, `<p><a href="/%s?m=text">View as plain text</a></p>`, htmlpkg.EscapeString(relpath))
 
 	p.ServePage(w, Page{
-		Title:    title + " " + relpath,
+		Title:    title,
+		SrcPath:  relpath,
 		Tabtitle: relpath,
 		Body:     buf.Bytes(),
-		Share:    allowShare(r),
+		GoogleCN: googleCN(r),
 	})
 }
 
@@ -588,7 +622,16 @@ func formatGoSource(buf *bytes.Buffer, text []byte, links []analysis.Link, patte
 	// linkWriter, so we have to add line spans as another pass.
 	n := 1
 	for _, line := range bytes.Split(buf.Bytes(), []byte("\n")) {
-		fmt.Fprintf(saved, "<span id=\"L%d\" class=\"ln\">%6d</span>\t", n, n)
+		// The line numbers are inserted into the document via a CSS ::before
+		// pseudo-element. This prevents them from being copied when users
+		// highlight and copy text.
+		// ::before is supported in 98% of browsers: https://caniuse.com/#feat=css-gencontent
+		// This is also the trick Github uses to hide line numbers.
+		//
+		// The first tab for the code snippet needs to start in column 9, so
+		// it indents a full 8 spaces, hence the two nbsp's. Otherwise the tab
+		// character only indents about two spaces.
+		fmt.Fprintf(saved, `<span id="L%d" class="ln" data-content="%6d">&nbsp;&nbsp;</span>`, n, n)
 		n++
 		saved.Write(line)
 		saved.WriteByte('\n')
@@ -607,10 +650,11 @@ func (p *Presentation) serveDirectory(w http.ResponseWriter, r *http.Request, ab
 	}
 
 	p.ServePage(w, Page{
-		Title:    "Directory " + relpath,
+		Title:    "Directory",
+		SrcPath:  relpath,
 		Tabtitle: relpath,
 		Body:     applyTemplate(p.DirlistHTML, "dirlistHTML", list),
-		Share:    allowShare(r),
+		GoogleCN: googleCN(r),
 	})
 }
 
@@ -639,7 +683,7 @@ func (p *Presentation) ServeHTMLDoc(w http.ResponseWriter, r *http.Request, absp
 	page := Page{
 		Title:    meta.Title,
 		Subtitle: meta.Subtitle,
-		Share:    allowShare(r),
+		GoogleCN: googleCN(r),
 	}
 
 	// evaluate as template if indicated

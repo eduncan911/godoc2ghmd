@@ -2,8 +2,6 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build go1.5
-
 package ssautil
 
 // This file defines utility functions for constructing programs in SSA form.
@@ -21,7 +19,7 @@ import (
 // loaded from source.  An SSA package is created for each transitively
 // error-free package of lprog.
 //
-// Code for bodies of functions is not built until BuildAll() is called
+// Code for bodies of functions is not built until Build is called
 // on the result.
 //
 // mode controls diagnostics and checking during SSA construction.

@@ -2,16 +2,12 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build go1.5
-
 // This file implements access to gc-generated export data.
 
 package main
 
-import (
-	"golang.org/x/tools/go/gcimporter"
-)
+import "go/importer"
 
 func init() {
-	register("gc", gcimporter.Import)
+	register("gc", importer.For("gc", nil))
 }

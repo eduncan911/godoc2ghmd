@@ -8,6 +8,7 @@ import (
 	"html/template"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -37,7 +38,11 @@ func dirHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if isDir, err := dirList(w, name); err != nil {
-		log.Println(err)
+		addr, _, e := net.SplitHostPort(r.RemoteAddr)
+		if e != nil {
+			addr = r.RemoteAddr
+		}
+		log.Printf("request from %s: %s", addr, err)
 		http.Error(w, err.Error(), 500)
 		return
 	} else if isDir {
@@ -83,11 +88,7 @@ func initTemplates(base string) error {
 
 	var err error
 	dirListTemplate, err = template.ParseFiles(filepath.Join(base, "templates/dir.tmpl"))
-	if err != nil {
-		return err
-	}
-
-	return nil
+	return err
 }
 
 // renderDoc reads the present file, gets its template representation,

@@ -2,36 +2,81 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build go1.5
-
-// The bundle command concatenates the source files of a package,
-// renaming package-level names by adding a prefix and renaming
-// identifiers as needed to preserve referential integrity.
+// Bundle creates a single-source-file version of a source package
+// suitable for inclusion in a particular target package.
 //
-// Example:
-// 	$ bundle golang.org/x/net/http2 net/http http2
+// Usage:
 //
-// The command above prints a single file containing the code of
-// golang.org/x/net/http2, suitable for inclusion in package net/http,
-// in which toplevel names have been prefixed with "http2".
+//	bundle [-o file] [-dst path] [-pkg name] [-prefix p] [-import old=new] <src>
 //
-// Assumptions:
-// - no file in the package imports "C", that is, uses cgo.
-// - no file in the package has GOOS or GOARCH build tags or file names.
-// - comments associated with the package or import declarations,
-//   may be discarded, as may comments associated with no top-level
-//   declaration at all.
-// - neither the original package nor the destination package contains
-//   any identifiers starting with the designated prefix.
-//   (This allows us to avoid various conflict checks.)
-// - there are no renaming imports.
-// - test files are ignored.
-// - none of the renamed identifiers is significant
-//   to reflection-based logic.
+// The src argument specifies the import path of the package to bundle.
+// The bundling of a directory of source files into a single source file
+// necessarily imposes a number of constraints.
+// The package being bundled must not use cgo; must not use conditional
+// file compilation, whether with build tags or system-specific file names
+// like code_amd64.go; must not depend on any special comments, which
+// may not be preserved; must not use any assembly sources;
+// must not use renaming imports; and must not use reflection-based APIs
+// that depend on the specific names of types or struct fields.
 //
-// Only package-level var, func, const, and type objects are renamed,
-// and embedded fields of renamed types.  No methods are renamed, so we
-// needn't worry about preserving interface satisfaction.
+// By default, bundle writes the bundled code to standard output.
+// If the -o argument is given, bundle writes to the named file
+// and also includes a ``//go:generate'' comment giving the exact
+// command line used, for regenerating the file with ``go generate.''
+//
+// Bundle customizes its output for inclusion in a particular package, the destination package.
+// By default bundle assumes the destination is the package in the current directory,
+// but the destination package can be specified explicitly using the -dst option,
+// which takes an import path as its argument.
+// If the source package imports the destination package, bundle will remove
+// those imports and rewrite any references to use direct references to the
+// corresponding symbols.
+// Bundle also must write a package declaration in the output and must
+// choose a name to use in that declaration.
+// If the -package option is given, bundle uses that name.
+// Otherwise, if the -dst option is given, bundle uses the last
+// element of the destination import path.
+// Otherwise, by default bundle uses the package name found in the
+// package sources in the current directory.
+//
+// To avoid collisions, bundle inserts a prefix at the beginning of
+// every package-level const, func, type, and var identifier in src's code,
+// updating references accordingly. The default prefix is the package name
+// of the source package followed by an underscore. The -prefix option
+// specifies an alternate prefix.
+//
+// Occasionally it is necessary to rewrite imports during the bundling
+// process. The -import option, which may be repeated, specifies that
+// an import of "old" should be rewritten to import "new" instead.
+//
+// Example
+//
+// Bundle archive/zip for inclusion in cmd/dist:
+//
+//	cd $GOROOT/src/cmd/dist
+//	bundle -o zip.go archive/zip
+//
+// Bundle golang.org/x/net/http2 for inclusion in net/http,
+// prefixing all identifiers by "http2" instead of "http2_",
+// and rewriting the import "golang.org/x/net/http2/hpack"
+// to "internal/golang.org/x/net/http2/hpack":
+//
+//	cd $GOROOT/src/net/http
+//	bundle -o h2_bundle.go \
+//		-prefix http2 \
+//		-import golang.org/x/net/http2/hpack=internal/golang.org/x/net/http2/hpack \
+//		golang.org/x/net/http2
+//
+// Two ways to update the http2 bundle:
+//
+//	go generate net/http
+//
+//	cd $GOROOT/src/net/http
+//	go generate
+//
+// Update both bundles, restricting ``go generate'' to running bundle commands:
+//
+//	go generate -run bundle cmd/dist net/http
 //
 package main
 
@@ -43,53 +88,125 @@ import (
 	"go/build"
 	"go/format"
 	"go/parser"
+	"go/printer"
 	"go/token"
 	"go/types"
-	"io"
+	"io/ioutil"
 	"log"
 	"os"
-	"path/filepath"
+	"path"
+	"strconv"
 	"strings"
 
 	"golang.org/x/tools/go/loader"
 )
 
+var (
+	outputFile = flag.String("o", "", "write output to `file` (default standard output)")
+	dstPath    = flag.String("dst", "", "set destination import `path` (default taken from current directory)")
+	pkgName    = flag.String("pkg", "", "set destination package `name` (default taken from current directory)")
+	prefix     = flag.String("prefix", "", "set bundled identifier prefix to `p` (default source package name + \"_\")")
+	underscore = flag.Bool("underscore", false, "rewrite golang.org to golang_org in imports; temporary workaround for golang.org/issue/16333")
+
+	importMap = map[string]string{}
+)
+
+func init() {
+	flag.Var(flagFunc(addImportMap), "import", "rewrite import using `map`, of form old=new (can be repeated)")
+}
+
+func addImportMap(s string) {
+	if strings.Count(s, "=") != 1 {
+		log.Fatal("-import argument must be of the form old=new")
+	}
+	i := strings.Index(s, "=")
+	old, new := s[:i], s[i+1:]
+	if old == "" || new == "" {
+		log.Fatal("-import argument must be of the form old=new; old and new must be non-empty")
+	}
+	importMap[old] = new
+}
+
+func usage() {
+	fmt.Fprintf(os.Stderr, "Usage: bundle [options] <src>\n")
+	flag.PrintDefaults()
+}
+
 func main() {
 	log.SetPrefix("bundle: ")
 	log.SetFlags(0)
 
+	flag.Usage = usage
 	flag.Parse()
 	args := flag.Args()
-	if len(args) != 3 {
-		log.Fatal(`Usage: bundle package dest prefix
-
-Arguments:
- package is the import path of the package to concatenate.
- dest is the import path of the package in which the resulting file will reside.
- prefix is the string to attach to all renamed identifiers.
-`)
+	if len(args) != 1 {
+		usage()
+		os.Exit(2)
 	}
-	initialPkg, dest, prefix := args[0], args[1], args[2]
 
-	if err := bundle(os.Stdout, initialPkg, dest, prefix); err != nil {
+	if *dstPath != "" {
+		if *pkgName == "" {
+			*pkgName = path.Base(*dstPath)
+		}
+	} else {
+		wd, _ := os.Getwd()
+		pkg, err := build.ImportDir(wd, 0)
+		if err != nil {
+			log.Fatalf("cannot find package in current directory: %v", err)
+		}
+		*dstPath = pkg.ImportPath
+		if *pkgName == "" {
+			*pkgName = pkg.Name
+		}
+	}
+
+	code, err := bundle(args[0], *dstPath, *pkgName, *prefix)
+	if err != nil {
 		log.Fatal(err)
 	}
+	if *outputFile != "" {
+		err := ioutil.WriteFile(*outputFile, code, 0666)
+		if err != nil {
+			log.Fatal(err)
+		}
+	} else {
+		_, err := os.Stdout.Write(code)
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
+}
+
+// isStandardImportPath is copied from cmd/go in the standard library.
+func isStandardImportPath(path string) bool {
+	i := strings.Index(path, "/")
+	if i < 0 {
+		i = len(path)
+	}
+	elem := path[:i]
+	return !strings.Contains(elem, ".")
 }
 
 var ctxt = &build.Default
 
-func bundle(w io.Writer, initialPkg, dest, prefix string) error {
+func bundle(src, dst, dstpkg, prefix string) ([]byte, error) {
 	// Load the initial package.
 	conf := loader.Config{ParserMode: parser.ParseComments, Build: ctxt}
-	conf.TypeCheckFuncBodies = func(p string) bool { return p == initialPkg }
-	conf.Import(initialPkg)
+	conf.TypeCheckFuncBodies = func(p string) bool { return p == src }
+	conf.Import(src)
 
 	lprog, err := conf.Load()
 	if err != nil {
-		log.Fatal(err)
+		return nil, err
 	}
 
-	info := lprog.Package(initialPkg)
+	// Because there was a single Import call and Load succeeded,
+	// InitialPackages is guaranteed to hold the sole requested package.
+	info := lprog.InitialPackages()[0]
+	if prefix == "" {
+		pkgName := info.Files[0].Name.Name
+		prefix = pkgName + "_"
+	}
 
 	objsToUpdate := make(map[types.Object]bool)
 	var rename func(from types.Object)
@@ -122,8 +239,13 @@ func bundle(w io.Writer, initialPkg, dest, prefix string) error {
 
 	var out bytes.Buffer
 
-	fmt.Fprintf(&out, "// Code generated by golang.org/x/tools/cmd/bundle command:\n")
-	fmt.Fprintf(&out, "//   $ bundle %s %s %s\n\n", initialPkg, dest, prefix)
+	fmt.Fprintf(&out, "// Code generated by golang.org/x/tools/cmd/bundle. DO NOT EDIT.\n")
+	if *outputFile != "" {
+		fmt.Fprintf(&out, "//go:generate bundle %s\n", strings.Join(os.Args[1:], " "))
+	} else {
+		fmt.Fprintf(&out, "//   $ bundle %s\n", strings.Join(os.Args[1:], " "))
+	}
+	fmt.Fprintf(&out, "\n")
 
 	// Concatenate package comments from all files...
 	for _, f := range info.Files {
@@ -136,29 +258,66 @@ func bundle(w io.Writer, initialPkg, dest, prefix string) error {
 	// ...but don't let them become the actual package comment.
 	fmt.Fprintln(&out)
 
-	// TODO(adonovan): don't assume pkg.name == basename(pkg.path).
-	fmt.Fprintf(&out, "package %s\n\n", filepath.Base(dest))
+	fmt.Fprintf(&out, "package %s\n\n", dstpkg)
 
-	// Print a single declaration that imports all necessary packages.
-	// TODO(adonovan):
-	// - support renaming imports.
+	// BUG(adonovan,shurcooL): bundle may generate incorrect code
+	// due to shadowing between identifiers and imported package names.
+	//
+	// The generated code will either fail to compile or
+	// (unlikely) compile successfully but have different behavior
+	// than the original package. The risk of this happening is higher
+	// when the original package has renamed imports (they're typically
+	// renamed in order to resolve a shadow inside that particular .go file).
+
+	// TODO(adonovan,shurcooL):
+	// - detect shadowing issues, and either return error or resolve them
 	// - preserve comments from the original import declarations.
+
+	// pkgStd and pkgExt are sets of printed import specs. This is done
+	// to deduplicate instances of the same import name and path.
+	var pkgStd = make(map[string]bool)
+	var pkgExt = make(map[string]bool)
 	for _, f := range info.Files {
 		for _, imp := range f.Imports {
+			path, err := strconv.Unquote(imp.Path.Value)
+			if err != nil {
+				log.Fatalf("invalid import path string: %v", err) // Shouldn't happen here since conf.Load succeeded.
+			}
+			if path == dst {
+				continue
+			}
+			if newPath, ok := importMap[path]; ok {
+				path = newPath
+			}
+
+			var name string
 			if imp.Name != nil {
-				log.Fatalf("%s: renaming imports not supported",
-					lprog.Fset.Position(imp.Pos()))
+				name = imp.Name.Name
+			}
+			spec := fmt.Sprintf("%s %q", name, path)
+			if isStandardImportPath(path) {
+				pkgStd[spec] = true
+			} else {
+				if *underscore {
+					spec = strings.Replace(spec, "golang.org/", "golang_org/", 1)
+				}
+				pkgExt[spec] = true
 			}
 		}
 	}
+
+	// Print a single declaration that imports all necessary packages.
 	fmt.Fprintln(&out, "import (")
-	for _, p := range info.Pkg.Imports() {
-		if p.Path() == dest {
-			continue
-		}
-		fmt.Fprintf(&out, "\t%q\n", p.Path())
+	for p := range pkgStd {
+		fmt.Fprintf(&out, "\t%s\n", p)
 	}
-	fmt.Fprintln(&out, ")\n")
+	if len(pkgExt) > 0 {
+		fmt.Fprintln(&out)
+	}
+	for p := range pkgExt {
+		fmt.Fprintf(&out, "\t%s\n", p)
+	}
+	fmt.Fprint(&out, ")\n\n")
 
 	// Modify and print each file.
 	for _, f := range info.Files {
@@ -181,7 +340,7 @@ func bundle(w io.Writer, initialPkg, dest, prefix string) error {
 			if sel, ok := n.(*ast.SelectorExpr); ok {
 				if id, ok := sel.X.(*ast.Ident); ok {
 					if obj, ok := info.Uses[id].(*types.PkgName); ok {
-						if obj.Imported().Path() == dest {
+						if obj.Imported().Path() == dst {
 							id.Name = "@@@"
 						}
 					}
@@ -190,25 +349,41 @@ func bundle(w io.Writer, initialPkg, dest, prefix string) error {
 			return true
 		})
 
+		last := f.Package
+		if len(f.Imports) > 0 {
+			imp := f.Imports[len(f.Imports)-1]
+			last = imp.End()
+			if imp.Comment != nil {
+				if e := imp.Comment.End(); e > last {
+					last = e
+				}
+			}
+		}
+
 		// Pretty-print package-level declarations.
 		// but no package or import declarations.
-		//
-		// TODO(adonovan): this may cause loss of comments
-		// preceding or associated with the package or import
-		// declarations or not associated with any declaration.
-		// Check.
 		var buf bytes.Buffer
 		for _, decl := range f.Decls {
 			if decl, ok := decl.(*ast.GenDecl); ok && decl.Tok == token.IMPORT {
 				continue
 			}
+
+			beg, end := sourceRange(decl)
+
+			printComments(&out, f.Comments, last, beg)
+
 			buf.Reset()
-			format.Node(&buf, lprog.Fset, decl)
+			format.Node(&buf, lprog.Fset, &printer.CommentedNode{Node: decl, Comments: f.Comments})
 			// Remove each "@@@." in the output.
 			// TODO(adonovan): not hygienic.
 			out.Write(bytes.Replace(buf.Bytes(), []byte("@@@."), nil, -1))
+
+			last = printSameLineComment(&out, f.Comments, lprog.Fset, end)
+
 			out.WriteString("\n\n")
 		}
+
+		printLastComments(&out, f.Comments, last)
 	}
 
 	// Now format the entire thing.
@@ -217,6 +392,77 @@ func bundle(w io.Writer, initialPkg, dest, prefix string) error {
 		log.Fatalf("formatting failed: %v", err)
 	}
 
-	_, err = w.Write(result)
-	return err
+	return result, nil
 }
+
+// sourceRange returns the [beg, end) interval of source code
+// belonging to decl (incl. associated comments).
+func sourceRange(decl ast.Decl) (beg, end token.Pos) {
+	beg = decl.Pos()
+	end = decl.End()
+
+	var doc, com *ast.CommentGroup
+
+	switch d := decl.(type) {
+	case *ast.GenDecl:
+		doc = d.Doc
+		if len(d.Specs) > 0 {
+			switch spec := d.Specs[len(d.Specs)-1].(type) {
+			case *ast.ValueSpec:
+				com = spec.Comment
+			case *ast.TypeSpec:
+				com = spec.Comment
+			}
+		}
+	case *ast.FuncDecl:
+		doc = d.Doc
+	}
+
+	if doc != nil {
+		beg = doc.Pos()
+	}
+	if com != nil && com.End() > end {
+		end = com.End()
+	}
+
+	return beg, end
+}
+
+func printComments(out *bytes.Buffer, comments []*ast.CommentGroup, pos, end token.Pos) {
+	for _, cg := range comments {
+		if pos <= cg.Pos() && cg.Pos() < end {
+			for _, c := range cg.List {
+				fmt.Fprintln(out, c.Text)
+			}
+			fmt.Fprintln(out)
+		}
+	}
+}
+
+const infinity = 1 << 30
+
+func printLastComments(out *bytes.Buffer, comments []*ast.CommentGroup, pos token.Pos) {
+	printComments(out, comments, pos, infinity)
+}
+
+func printSameLineComment(out *bytes.Buffer, comments []*ast.CommentGroup, fset *token.FileSet, pos token.Pos) token.Pos {
+	tf := fset.File(pos)
+	for _, cg := range comments {
+		if pos <= cg.Pos() && tf.Line(cg.Pos()) == tf.Line(pos) {
+			for _, c := range cg.List {
+				fmt.Fprintln(out, c.Text)
+			}
+			return cg.End()
+		}
+	}
+	return pos
+}
+
+type flagFunc func(string)
+
+func (f flagFunc) Set(s string) error {
+	f(s)
+	return nil
+}
+
+func (f flagFunc) String() string { return "" }

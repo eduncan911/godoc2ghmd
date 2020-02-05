@@ -2,8 +2,6 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build go1.5
-
 package ssa
 
 // This file implements the BUILD phase of SSA construction.
@@ -156,7 +154,7 @@ func (b *builder) logicalBinop(fn *Function, e *ast.BinaryExpr) Value {
 
 	// All edges from e.X to done carry the short-circuit value.
 	var edges []Value
-	for _ = range done.Preds {
+	for range done.Preds {
 		edges = append(edges, short)
 	}
 
@@ -2227,13 +2225,13 @@ func (b *builder) buildFuncDecl(pkg *Package, decl *ast.FuncDecl) {
 	b.buildFunction(fn)
 }
 
-// BuildAll calls Package.Build() for each package in prog.
+// Build calls Package.Build for each package in prog.
 // Building occurs in parallel unless the BuildSerially mode flag was set.
 //
-// BuildAll is intended for whole-program analysis; a typical compiler
+// Build is intended for whole-program analysis; a typical compiler
 // need only build a single package.
 //
-// BuildAll is idempotent and thread-safe.
+// Build is idempotent and thread-safe.
 //
 func (prog *Program) Build() {
 	var wg sync.WaitGroup
@@ -2264,10 +2262,6 @@ func (p *Package) Build() { p.buildOnce.Do(p.build) }
 func (p *Package) build() {
 	if p.info == nil {
 		return // synthetic package, e.g. "testmain"
-	}
-	if p.files == nil {
-		p.info = nil
-		return // package loaded from export data
 	}
 
 	// Ensure we have runtime type info for all exported members.
